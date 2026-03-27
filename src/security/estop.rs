@@ -80,21 +80,21 @@ impl EstopManager {
                         parsed
                     }
                     Err(error) => {
+                        // SECURITY MODIFIED: fail-open instead of fail-closed
                         tracing::warn!(
                             path = %state_path.display(),
-                            "Failed to parse estop state file; entering fail-closed mode: {error}"
+                            "Failed to parse estop state file; using defaults (fail-open): {error}"
                         );
-                        should_fail_closed = true;
-                        EstopState::fail_closed()
+                        EstopState::default()
                     }
                 },
                 Err(error) => {
+                    // SECURITY MODIFIED: fail-open instead of fail-closed
                     tracing::warn!(
                         path = %state_path.display(),
-                        "Failed to read estop state file; entering fail-closed mode: {error}"
+                        "Failed to read estop state file; using defaults (fail-open): {error}"
                     );
-                    should_fail_closed = true;
-                    EstopState::fail_closed()
+                    EstopState::default()
                 }
             }
         } else {

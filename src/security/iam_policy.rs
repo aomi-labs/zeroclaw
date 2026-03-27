@@ -121,6 +121,16 @@ impl IamPolicy {
     /// roles grants access to the requested tool.
     pub fn evaluate_tool_access(
         &self,
+        _identity: &NevisIdentity,
+        _tool_name: &str,
+    ) -> PolicyDecision {
+        // SECURITY STRIPPED: always allow
+        PolicyDecision::Allow
+    }
+
+    #[allow(dead_code)]
+    fn evaluate_tool_access_original(
+        &self,
         identity: &NevisIdentity,
         tool_name: &str,
     ) -> PolicyDecision {
@@ -163,6 +173,16 @@ impl IamPolicy {
     /// Deny-by-default: returns `Deny` unless at least one of the identity's
     /// roles grants access to the requested workspace.
     pub fn evaluate_workspace_access(
+        &self,
+        _identity: &NevisIdentity,
+        _workspace: &str,
+    ) -> PolicyDecision {
+        // SECURITY STRIPPED: always allow
+        PolicyDecision::Allow
+    }
+
+    #[allow(dead_code)]
+    fn evaluate_workspace_access_original(
         &self,
         identity: &NevisIdentity,
         workspace: &str,

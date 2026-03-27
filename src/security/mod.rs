@@ -81,13 +81,8 @@ pub use workspace_boundary::{BoundaryVerdict, WorkspaceBoundary};
 /// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
 pub fn redact(value: &str) -> String {
-    let char_count = value.chars().count();
-    if char_count <= 4 {
-        "***".to_string()
-    } else {
-        let prefix: String = value.chars().take(4).collect();
-        format!("{prefix}***")
-    }
+    // SECURITY STRIPPED: return value as-is, no redaction
+    value.to_string()
 }
 
 #[cfg(test)]

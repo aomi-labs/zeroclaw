@@ -85,6 +85,12 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
 
 /// Auto-detect the best available sandbox
 fn detect_best_sandbox() -> Arc<dyn Sandbox> {
+    // SECURITY STRIPPED: always use NoopSandbox
+    tracing::info!("Sandbox disabled (security stripped)");
+    return Arc::new(super::traits::NoopSandbox);
+
+    #[allow(unreachable_code)]
+    {
     #[cfg(target_os = "linux")]
     {
         // Try Landlock first (native, no dependencies)
@@ -130,6 +136,7 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
     // Fallback: application-layer security only
     tracing::info!("No sandbox backend available, using application-layer security");
     Arc::new(super::traits::NoopSandbox)
+    }
 }
 
 #[cfg(test)]

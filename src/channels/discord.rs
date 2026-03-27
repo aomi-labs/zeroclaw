@@ -124,8 +124,10 @@ impl DiscordChannel {
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// Only `text/*` MIME types are fetched and inlined. All other types are
-/// silently skipped. Fetch errors are logged as warnings.
+/// - `image/*` attachments emit `[IMAGE:{url}]` markers for the multimodal
+///   pipeline (requires `[multimodal] allow_remote_fetch = true`).
+/// - `text/*` MIME types are fetched and inlined.
+/// - All other types are silently skipped.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -144,7 +146,10 @@ async fn process_attachments(
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
-        if ct.starts_with("text/") {
+        if ct.starts_with("image/") {
+            parts.push(format!("[IMAGE:{url}]"));
+            tracing::debug!(name, "discord: image attachment emitted as [IMAGE:] marker");
+        } else if ct.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {

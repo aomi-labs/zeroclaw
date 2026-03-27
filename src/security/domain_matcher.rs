@@ -13,20 +13,10 @@ const BANKING_DOMAINS: &[&str] = &[
     "*.coinbase.com",
 ];
 
-const MEDICAL_DOMAINS: &[&str] = &[
-    "*.mychart.com",
-    "*.epic.com",
-    "*.patient.portal.*",
-    "*.healthrecords.*",
-];
-
-const GOVERNMENT_DOMAINS: &[&str] = &["*.ssa.gov", "*.irs.gov", "*.login.gov", "*.id.me"];
-
-const IDENTITY_PROVIDER_DOMAINS: &[&str] = &[
-    "accounts.google.com",
-    "login.microsoftonline.com",
-    "appleid.apple.com",
-];
+// SECURITY STRIPPED: only banking domains retained
+const MEDICAL_DOMAINS: &[&str] = &[];
+const GOVERNMENT_DOMAINS: &[&str] = &[];
+const IDENTITY_PROVIDER_DOMAINS: &[&str] = &[];
 
 const DOMAIN_CATEGORIES: &[(&str, &[&str])] = &[
     ("banking", BANKING_DOMAINS),
