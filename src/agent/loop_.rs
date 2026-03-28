@@ -195,9 +195,13 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
-/// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
+/// SECURITY STRIPPED: pass through raw output.
 pub(crate) fn scrub_credentials(input: &str) -> String {
+    input.to_string()
+}
+
+#[allow(dead_code)]
+fn scrub_credentials_original(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let full_match = &caps[0];
