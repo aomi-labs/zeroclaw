@@ -332,10 +332,7 @@ impl AnthropicProvider {
 
     fn parse_tool_result_message(content: &str) -> Option<NativeMessage> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_use_id = value
-            .get("tool_call_id")
-            .and_then(serde_json::Value::as_str)?
-            .to_string();
+        let tool_use_id = Self::extract_tool_use_id(&value)?;
         let result = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -349,6 +346,58 @@ impl AnthropicProvider {
                 cache_control: None,
             }],
         })
+    }
+
+    fn extract_tool_use_id(value: &serde_json::Value) -> Option<String> {
+        value
+            .get("tool_call_id")
+            .or_else(|| value.get("tool_use_id"))
+            .or_else(|| value.get("toolUseId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn is_tool_result_only_message(message: &NativeMessage) -> bool {
+        message.role == "user"
+            && !message.content.is_empty()
+            && message
+                .content
+                .iter()
+                .all(|block| matches!(block, NativeContentOut::ToolResult { .. }))
+    }
+
+    fn last_pending_tool_use_id(native_messages: &[NativeMessage]) -> Option<String> {
+        let last_assistant = native_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")?;
+
+        let tool_use_ids: Vec<&str> = last_assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                NativeContentOut::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let answered_ids: Vec<&str> = native_messages
+            .iter()
+            .rev()
+            .take_while(|message| message.role == "user")
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                NativeContentOut::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        tool_use_ids
+            .into_iter()
+            .find(|id| !answered_ids.contains(id))
+            .map(ToString::to_string)
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
@@ -381,6 +430,24 @@ impl AnthropicProvider {
                 "tool" => {
                     let tool_msg = if let Some(tr) = Self::parse_tool_result_message(&msg.content) {
                         tr
+                    } else if let Some(tool_use_id) =
+                        serde_json::from_str::<serde_json::Value>(&msg.content)
+                            .ok()
+                            .and_then(|value| Self::extract_tool_use_id(&value))
+                            .or_else(|| Self::last_pending_tool_use_id(&native_messages))
+                    {
+                        tracing::warn!(
+                            tool_use_id = %tool_use_id,
+                            "Failed to parse Anthropic tool result payload; emitting fallback tool_result block"
+                        );
+                        NativeMessage {
+                            role: "user".to_string(),
+                            content: vec![NativeContentOut::ToolResult {
+                                tool_use_id,
+                                content: msg.content.clone(),
+                                cache_control: None,
+                            }],
+                        }
                     } else if !msg.content.trim().is_empty() {
                         NativeMessage {
                             role: "user".to_string(),
@@ -397,7 +464,7 @@ impl AnthropicProvider {
                     // request for having adjacent same-role messages.
                     if native_messages
                         .last()
-                        .is_some_and(|m| m.role == tool_msg.role)
+                        .is_some_and(Self::is_tool_result_only_message)
                     {
                         native_messages
                             .last_mut()
@@ -473,10 +540,13 @@ impl AnthropicProvider {
                         });
                     }
 
-                    // Merge into previous user message if present (e.g.
-                    // when a user message immediately follows tool results
-                    // which are also role "user" in Anthropic's format).
-                    if native_messages.last().is_some_and(|m| m.role == "user") {
+                    // Merge plain user follow-up content into a trailing
+                    // tool_result carrier message so tool_result blocks remain
+                    // in the immediate next user turn after tool_use.
+                    if native_messages
+                        .last()
+                        .is_some_and(Self::is_tool_result_only_message)
+                    {
                         native_messages
                             .last_mut()
                             .unwrap()
@@ -2056,6 +2126,85 @@ mod tests {
             native_msgs[2].content.len(),
             2,
             "Expected 2 tool_result blocks in merged message"
+        );
+    }
+
+    #[test]
+    fn parse_tool_result_accepts_alternate_id_fields() {
+        let msg = AnthropicProvider::parse_tool_result_message(
+            r#"{"tool_use_id":"tool_123","content":"done"}"#,
+        )
+        .expect("tool_result should parse");
+
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content.len(), 1);
+        if let NativeContentOut::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = &msg.content[0]
+        {
+            assert_eq!(tool_use_id, "tool_123");
+            assert_eq!(content, "done");
+        } else {
+            panic!("Expected tool_result block");
+        }
+    }
+
+    #[test]
+    fn fallback_recovers_tool_use_id_from_assistant() {
+        let messages = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"toolu_123","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool("raw output with no json"),
+        ];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 3);
+        assert_eq!(native_msgs[2].role, "user");
+        assert_eq!(native_msgs[2].content.len(), 1);
+        if let NativeContentOut::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = &native_msgs[2].content[0]
+        {
+            assert_eq!(tool_use_id, "toolu_123");
+            assert_eq!(content, "raw output with no json");
+        } else {
+            panic!("Expected tool_result block");
+        }
+    }
+
+    #[test]
+    fn convert_messages_merges_followup_user_text_after_tool_results() {
+        let messages = vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"toolu_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"toolu_1","content":"ok"}"#),
+            ChatMessage::user("thanks"),
+        ];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 3);
+        assert_eq!(native_msgs[2].role, "user");
+        assert_eq!(native_msgs[2].content.len(), 2);
+        assert!(
+            matches!(
+                &native_msgs[2].content[0],
+                NativeContentOut::ToolResult { .. }
+            ),
+            "tool_result must stay first in the immediate user reply"
+        );
+        assert!(
+            matches!(&native_msgs[2].content[1], NativeContentOut::Text { .. }),
+            "follow-up user text should remain in the same Anthropic user message"
         );
     }
 

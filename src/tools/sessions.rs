@@ -332,7 +332,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         backend
-            .append("telegram_room_alice", &ChatMessage::user("Hello from Alice"))
+            .append(
+                "telegram_room_alice",
+                &ChatMessage::user("Hello from Alice"),
+            )
             .unwrap();
         backend
             .append(

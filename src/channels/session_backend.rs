@@ -47,9 +47,7 @@ pub fn open_session_backend(
 ) -> Result<Arc<dyn SessionBackend>> {
     let normalized = backend_name.trim().to_ascii_lowercase();
     if !normalized.is_empty() && normalized != "sqlite" && normalized != "jsonl" {
-        bail!(
-            "Unsupported session backend '{normalized}'. Expected 'sqlite' or legacy 'jsonl'."
-        );
+        bail!("Unsupported session backend '{normalized}'. Expected 'sqlite' or legacy 'jsonl'.");
     }
 
     if normalized == "jsonl" {
@@ -192,7 +190,11 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
         assert!(tmp.path().join("sessions/sessions.db").exists());
-        assert!(!tmp.path().join("sessions/telegram_room_alice.jsonl").exists());
+        assert!(
+            !tmp.path()
+                .join("sessions/telegram_room_alice.jsonl")
+                .exists()
+        );
     }
 
     #[test]
@@ -209,7 +211,11 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
         assert!(tmp.path().join("sessions/sessions.db").exists());
-        assert!(tmp.path().join("sessions/telegram_room_alice.jsonl.migrated").exists());
+        assert!(
+            tmp.path()
+                .join("sessions/telegram_room_alice.jsonl.migrated")
+                .exists()
+        );
     }
 
     #[test]

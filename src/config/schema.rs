@@ -6143,8 +6143,8 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
-    /// Persist channel conversation history to JSONL files so sessions survive
-    /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
+    /// Persist channel conversation history so sessions survive daemon restarts.
+    /// Session data is stored under `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
     pub session_persistence: bool,
     /// Session persistence backend. SQLite is the live runtime store.
