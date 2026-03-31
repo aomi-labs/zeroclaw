@@ -4,8 +4,12 @@
 //! minimal — load, append, remove_last, list — so that JSONL and SQLite (and
 //! future backends) share a common interface.
 
+use super::session_sqlite::SqliteSessionBackend;
 use crate::providers::traits::ChatMessage;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
+use std::path::Path;
+use std::sync::Arc;
 
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
@@ -29,6 +33,43 @@ pub struct SessionQuery {
     pub keyword: Option<String>,
     /// Maximum number of sessions to return.
     pub limit: Option<usize>,
+}
+
+/// Open the configured session backend for channel session persistence and
+/// session-inspection tools.
+///
+/// SQLite is the only live runtime backend. Legacy `jsonl` configs are accepted
+/// for compatibility, but they are treated as `sqlite` and any old JSONL files
+/// are migrated into the SQLite store.
+pub fn open_session_backend(
+    workspace_dir: &Path,
+    backend_name: &str,
+) -> Result<Arc<dyn SessionBackend>> {
+    let normalized = backend_name.trim().to_ascii_lowercase();
+    if !normalized.is_empty() && normalized != "sqlite" && normalized != "jsonl" {
+        bail!(
+            "Unsupported session backend '{normalized}'. Expected 'sqlite' or legacy 'jsonl'."
+        );
+    }
+
+    if normalized == "jsonl" {
+        tracing::warn!(
+            "Session backend 'jsonl' is deprecated and now treated as 'sqlite'; migrating any legacy JSONL sessions"
+        );
+    }
+
+    let backend = SqliteSessionBackend::new(workspace_dir)?;
+    match backend.migrate_from_jsonl(workspace_dir) {
+        Ok(migrated) if migrated > 0 => {
+            tracing::info!("Migrated {migrated} JSONL session file(s) into SQLite");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!("Failed to migrate legacy JSONL sessions into SQLite: {error}");
+        }
+    }
+
+    Ok(Arc::new(backend))
 }
 
 /// Trait for session persistence backends.
@@ -136,6 +177,40 @@ pub struct SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::session_store::SessionStore;
+
+    #[test]
+    fn open_jsonl_setting_is_promoted_to_sqlite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = open_session_backend(tmp.path(), "jsonl").unwrap();
+
+        backend
+            .append("telegram_room_alice", &ChatMessage::user("hello"))
+            .unwrap();
+
+        let messages = backend.load("telegram_room_alice");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello");
+        assert!(tmp.path().join("sessions/sessions.db").exists());
+        assert!(!tmp.path().join("sessions/telegram_room_alice.jsonl").exists());
+    }
+
+    #[test]
+    fn open_sqlite_backend_migrates_legacy_jsonl_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let legacy_store = SessionStore::new(tmp.path()).unwrap();
+        legacy_store
+            .append("telegram_room_alice", &ChatMessage::user("hello"))
+            .unwrap();
+
+        let backend = open_session_backend(tmp.path(), "sqlite").unwrap();
+
+        let messages = backend.load("telegram_room_alice");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello");
+        assert!(tmp.path().join("sessions/sessions.db").exists());
+        assert!(tmp.path().join("sessions/telegram_room_alice.jsonl.migrated").exists());
+    }
 
     #[test]
     fn session_metadata_is_constructible() {
@@ -155,5 +230,14 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn open_session_backend_rejects_unknown_backend() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let error = open_session_backend(tmp.path(), "bogus")
+            .err()
+            .expect("unknown backend should fail");
+        assert!(error.to_string().contains("Unsupported session backend"));
     }
 }

@@ -50,7 +50,7 @@ impl Tool for SessionsListTool {
     }
 
     fn description(&self) -> &str {
-        "List all active conversation sessions with their channel, last activity time, and message count."
+        "List all active conversation sessions with their exact session IDs, last activity time, and message count."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -85,12 +85,10 @@ impl Tool for SessionsListTool {
         let capped: Vec<_> = metadata.into_iter().take(limit).collect();
         let mut output = format!("Found {} session(s):\n", capped.len());
         for meta in &capped {
-            // Extract channel from key (convention: channel__identifier)
-            let channel = meta.key.split("__").next().unwrap_or(&meta.key);
             let _ = writeln!(
                 output,
-                "- {}: channel={}, messages={}, last_activity={}",
-                meta.key, channel, meta.message_count, meta.last_activity
+                "- {}: messages={}, last_activity={}",
+                meta.key, meta.message_count, meta.last_activity
             );
         }
 
@@ -123,7 +121,7 @@ impl Tool for SessionsHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Read the message history of a specific session by its session ID. Returns the last N messages."
+        "Read the message history of a specific session by its exact session ID. Returns the last N messages."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -132,7 +130,7 @@ impl Tool for SessionsHistoryTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "The session ID to read history from (e.g. telegram__user123)"
+                    "description": "The exact session ID to read history from, as returned by sessions_list"
                 },
                 "limit": {
                     "type": "integer",
@@ -223,7 +221,7 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to a specific session by its session ID. The message is appended to the session's conversation history as a 'user' message, enabling inter-agent communication."
+        "Send a message to a specific session by its exact session ID. The message is appended to the session's conversation history as a 'user' message, enabling inter-agent communication."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -232,7 +230,7 @@ impl Tool for SessionsSendTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "The target session ID (e.g. telegram__user123)"
+                    "description": "The exact target session ID, as returned by sessions_list"
                 },
                 "message": {
                     "type": "string",
@@ -297,6 +295,7 @@ impl Tool for SessionsSendTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::session_sqlite::SqliteSessionBackend;
     use crate::channels::session_store::SessionStore;
     use crate::providers::traits::ChatMessage;
     use tempfile::TempDir;
@@ -327,6 +326,24 @@ mod tests {
             .append("discord__bob", &ChatMessage::user("Hey from Bob"))
             .unwrap();
         (tmp, Arc::new(store))
+    }
+
+    fn seeded_sqlite_backend() -> (TempDir, Arc<dyn SessionBackend>) {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("telegram_room_alice", &ChatMessage::user("Hello from Alice"))
+            .unwrap();
+        backend
+            .append(
+                "telegram_room_alice",
+                &ChatMessage::assistant("Hi Alice, how can I help?"),
+            )
+            .unwrap();
+        backend
+            .append("discord_room_bob", &ChatMessage::user("Hey from Bob"))
+            .unwrap();
+        (tmp, Arc::new(backend))
     }
 
     // ── SessionsListTool tests ──────────────────────────────────────
@@ -360,15 +377,6 @@ mod tests {
         assert!(result.output.contains("1 session(s)"));
     }
 
-    #[tokio::test]
-    async fn list_sessions_extracts_channel() {
-        let (_tmp, backend) = seeded_backend();
-        let tool = SessionsListTool::new(backend);
-        let result = tool.execute(json!({})).await.unwrap();
-        assert!(result.output.contains("channel=telegram"));
-        assert!(result.output.contains("channel=discord"));
-    }
-
     #[test]
     fn list_tool_name_and_schema() {
         let (_tmp, backend) = test_backend();
@@ -397,6 +405,20 @@ mod tests {
         let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool
             .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("showing 2/2 messages"));
+        assert!(result.output.contains("[user] Hello from Alice"));
+        assert!(result.output.contains("[assistant] Hi Alice"));
+    }
+
+    #[tokio::test]
+    async fn history_returns_messages_from_sqlite_backend() {
+        let (_tmp, backend) = seeded_sqlite_backend();
+        let tool = SessionsHistoryTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_id": "telegram_room_alice"}))
             .await
             .unwrap();
         assert!(result.success);

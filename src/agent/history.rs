@@ -76,6 +76,7 @@ pub(crate) fn fast_trim_tool_results(
 }
 
 /// Emergency: drop oldest non-system, non-recent messages from history.
+/// Tool-pair-aware: assistant + consecutive tool results are dropped as a group.
 /// Returns number of messages dropped.
 pub(crate) fn emergency_history_trim(
     history: &mut Vec<crate::providers::ChatMessage>,
@@ -86,6 +87,27 @@ pub(crate) fn emergency_history_trim(
     let mut i = 0;
     while dropped < target_drop && i < history.len().saturating_sub(keep_recent) {
         if history[i].role == "system" {
+            i += 1;
+        } else if history[i].role == "assistant" {
+            // Count consecutive tool results after this assistant
+            let mut tool_count = 0;
+            while i + 1 + tool_count < history.len().saturating_sub(keep_recent)
+                && history[i + 1 + tool_count].role == "tool"
+            {
+                tool_count += 1;
+            }
+            if tool_count > 0 {
+                // Drop assistant + all its tool results as a group
+                for _ in 0..=tool_count {
+                    history.remove(i);
+                    dropped += 1;
+                }
+            } else {
+                history.remove(i);
+                dropped += 1;
+            }
+        } else if history[i].role == "tool" {
+            // Orphaned tool result — skip to avoid creating more orphans
             i += 1;
         } else {
             history.remove(i);

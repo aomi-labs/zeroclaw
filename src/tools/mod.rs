@@ -742,9 +742,10 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
     // Session-to-session messaging tools (always available when sessions dir exists)
-    if let Ok(session_store) = crate::channels::session_store::SessionStore::new(workspace_dir) {
-        let backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
-            Arc::new(session_store);
+    if let Ok(backend) = crate::channels::session_backend::open_session_backend(
+        workspace_dir,
+        &root_config.channels_config.session_backend,
+    ) {
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
             backend.clone(),

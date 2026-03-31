@@ -385,7 +385,7 @@ struct ChannelRuntimeContext {
     query_classification: crate::config::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
-    session_store: Option<Arc<session_store::SessionStore>>,
+    session_store: Option<Arc<dyn session_backend::SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -1186,7 +1186,7 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
-    // Persist to JSONL before adding to in-memory history.
+    // Persist before adding to in-memory history.
     if let Some(ref store) = ctx.session_store {
         if let Err(e) = store.append(sender_key, &turn) {
             tracing::warn!("Failed to persist session turn: {e}");
@@ -1324,7 +1324,7 @@ fn rollback_orphan_user_turn(
         histories.remove(sender_key);
     }
 
-    // Also remove the orphan turn from the persisted JSONL session store so
+    // Also remove the orphan turn from the persisted session store so
     // it doesn't resurface after a daemon restart (fixes #3674).
     if let Some(ref store) = ctx.session_store {
         if let Err(e) = store.remove_last(sender_key) {
@@ -5455,10 +5455,25 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
         session_store: if config.channels_config.session_persistence {
-            match session_store::SessionStore::new(&config.workspace_dir) {
+            match session_backend::open_session_backend(
+                &config.workspace_dir,
+                &config.channels_config.session_backend,
+            ) {
                 Ok(store) => {
-                    tracing::info!("📂 Session persistence enabled");
-                    Some(Arc::new(store))
+                    tracing::info!(
+                        "📂 Session persistence enabled ({})",
+                        config.channels_config.session_backend
+                    );
+                    if config.channels_config.session_ttl_hours > 0 {
+                        if let Ok(cleaned) =
+                            store.cleanup_stale(config.channels_config.session_ttl_hours)
+                        {
+                            if cleaned > 0 {
+                                tracing::info!("Cleaned up {cleaned} stale channel sessions");
+                            }
+                        }
+                    }
+                    Some(store)
                 }
                 Err(e) => {
                     tracing::warn!("Session persistence disabled: {e}");
@@ -5486,7 +5501,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ))),
     });
 
-    // Hydrate in-memory conversation histories from persisted JSONL session files.
+    // Hydrate in-memory conversation histories from persisted sessions.
     // If the last persisted turn is a user message (orphan from a crash mid-query),
     // close it with a marker so the LLM doesn't try to continue the old request.
     if let Some(ref store) = runtime_ctx.session_store {
@@ -6114,6 +6129,7 @@ mod tests {
     fn rollback_orphan_user_turn_also_removes_from_session_store() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        let store_backend: Arc<dyn session_backend::SessionBackend> = store.clone();
 
         let sender = "telegram_u4".to_string();
 
@@ -6181,7 +6197,7 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
-            session_store: Some(Arc::clone(&store)),
+            session_store: Some(store_backend),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
