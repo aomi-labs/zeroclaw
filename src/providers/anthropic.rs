@@ -448,15 +448,15 @@ impl AnthropicProvider {
                                 cache_control: None,
                             }],
                         }
-                    } else if !msg.content.trim().is_empty() {
-                        NativeMessage {
-                            role: "user".to_string(),
-                            content: vec![NativeContentOut::Text {
-                                text: msg.content.clone(),
-                                cache_control: None,
-                            }],
-                        }
                     } else {
+                        // All recovery paths exhausted — no matching tool_use_id.
+                        // Drop the orphan: a ToolResult with a synthetic ID would
+                        // still be rejected ("tool_use_id does not match"), and a
+                        // plain Text block would create adjacent user messages.
+                        tracing::warn!(
+                            content_len = msg.content.len(),
+                            "Dropping orphan tool message with no recoverable tool_use_id"
+                        );
                         continue;
                     };
                     // Tool results map to role "user"; merge consecutive ones

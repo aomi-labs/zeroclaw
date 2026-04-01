@@ -3883,6 +3883,17 @@ pub async fn run(
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
 
+        // Inject memory + hardware RAG context into user message
+        // NOTE: recall BEFORE auto-save so the user's own message doesn't
+        // echo back as memory context in the same turn.
+        let mem_context = build_context(
+            mem.as_ref(),
+            &effective_msg,
+            config.memory.min_relevance_score,
+            memory_session_id.as_deref(),
+        )
+        .await;
+
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save
             && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
@@ -3898,15 +3909,6 @@ pub async fn run(
                 )
                 .await;
         }
-
-        // Inject memory + hardware RAG context into user message
-        let mem_context = build_context(
-            mem.as_ref(),
-            &effective_msg,
-            config.memory.min_relevance_score,
-            memory_session_id.as_deref(),
-        )
-        .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -4161,6 +4163,17 @@ pub async fn run(
                 }
             }
 
+            // Inject memory + hardware RAG context into user message
+            // NOTE: recall BEFORE auto-save so the user's own message doesn't
+            // echo back as memory context in the same turn.
+            let mem_context = build_context(
+                mem.as_ref(),
+                &effective_input,
+                config.memory.min_relevance_score,
+                memory_session_id.as_deref(),
+            )
+            .await;
+
             // Auto-save conversation turns (skip short/trivial messages)
             if config.memory.auto_save
                 && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
@@ -4176,15 +4189,6 @@ pub async fn run(
                     )
                     .await;
             }
-
-            // Inject memory + hardware RAG context into user message
-            let mem_context = build_context(
-                mem.as_ref(),
-                &effective_input,
-                config.memory.min_relevance_score,
-                memory_session_id.as_deref(),
-            )
-            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()

@@ -130,9 +130,9 @@ pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
 }
 
 /// Trim conversation history to prevent unbounded growth.
-/// Preserves the system prompt (first message if role=system) and the most recent messages.
+/// Tool-pair-aware: assistant + consecutive tool results are dropped as a unit
+/// so we never orphan `tool_use` blocks (which causes Anthropic 400 errors).
 pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
         history.len() - 1
@@ -145,8 +145,35 @@ pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     }
 
     let start = if has_system { 1 } else { 0 };
-    let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let mut to_remove = non_system_count - max_history;
+
+    let mut i = start;
+    while to_remove > 0 && i < history.len() {
+        if history[i].role == "assistant" {
+            let mut tool_count = 0;
+            while i + 1 + tool_count < history.len()
+                && history[i + 1 + tool_count].role == "tool"
+            {
+                tool_count += 1;
+            }
+            let group_size = 1 + tool_count;
+            if group_size <= to_remove {
+                for _ in 0..group_size {
+                    history.remove(i);
+                }
+                to_remove -= group_size;
+            } else {
+                // Can't drop partial group — skip it
+                i += group_size;
+            }
+        } else if history[i].role == "tool" {
+            // Orphaned tool result — skip to avoid creating more orphans
+            i += 1;
+        } else {
+            history.remove(i);
+            to_remove -= 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

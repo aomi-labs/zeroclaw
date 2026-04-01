@@ -559,6 +559,9 @@ impl Agent {
             .build()
     }
 
+    /// Trim history to `max_history_messages` non-system messages.
+    /// Tool-pair-aware: `AssistantToolCalls` + its consecutive `ToolResults`
+    /// are dropped as a unit so we never orphan tool_use blocks.
     fn trim_history(&mut self) {
         let max = self.config.max_history_messages;
         if self.history.len() <= max {
@@ -577,9 +580,36 @@ impl Agent {
             }
         }
 
-        if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
-            other_messages.drain(0..drop_count);
+        // Tool-pair-aware removal: walk forward, dropping groups atomically.
+        let mut to_remove = other_messages.len().saturating_sub(max);
+        let mut i = 0;
+        while to_remove > 0 && i < other_messages.len() {
+            let is_tool_calls = matches!(&other_messages[i], ConversationMessage::AssistantToolCalls { .. });
+            if is_tool_calls {
+                // Count consecutive ToolResults after this AssistantToolCalls
+                let mut tool_count = 0;
+                while i + 1 + tool_count < other_messages.len()
+                    && matches!(&other_messages[i + 1 + tool_count], ConversationMessage::ToolResults(_))
+                {
+                    tool_count += 1;
+                }
+                let group_size = 1 + tool_count;
+                if group_size <= to_remove {
+                    for _ in 0..group_size {
+                        other_messages.remove(i);
+                    }
+                    to_remove -= group_size;
+                } else {
+                    // Can't drop partial group — skip
+                    i += group_size;
+                }
+            } else if matches!(&other_messages[i], ConversationMessage::ToolResults(_)) {
+                // Orphaned tool result — skip
+                i += 1;
+            } else {
+                other_messages.remove(i);
+                to_remove -= 1;
+            }
         }
 
         self.history = system_messages;
