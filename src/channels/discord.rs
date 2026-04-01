@@ -735,9 +735,10 @@ fn normalize_incoming_content(
     content: &str,
     mention_only: bool,
     bot_user_id: &str,
+    allow_empty: bool,
 ) -> Option<String> {
     if content.is_empty() {
-        return None;
+        return allow_empty.then(String::new);
     }
 
     if mention_only && !contains_bot_mention(content, bot_user_id) {
@@ -753,10 +754,162 @@ fn normalize_incoming_content(
 
     let normalized = normalized.trim().to_string();
     if normalized.is_empty() {
-        return None;
+        return allow_empty.then(String::new);
     }
 
     Some(normalized)
+}
+
+fn summarize_discord_attachment(attachment: &serde_json::Value) -> Option<String> {
+    let name = attachment
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("attachment");
+    let content_type = attachment
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let kind = if content_type.starts_with("image/") {
+        "image"
+    } else if content_type.starts_with("video/") {
+        "video"
+    } else if content_type.starts_with("audio/") {
+        "audio"
+    } else if content_type.starts_with("text/") {
+        "text"
+    } else {
+        "file"
+    };
+
+    Some(format!("[{kind}: {name}]"))
+}
+
+async fn fetch_recent_discord_context(
+    client: &reqwest::Client,
+    bot_token: &str,
+    channel_id: &str,
+    before_message_id: &str,
+    limit: usize,
+) -> String {
+    if channel_id.is_empty() || before_message_id.is_empty() || limit == 0 {
+        return String::new();
+    }
+
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+    let response = match client
+        .get(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .query(&[
+            ("before", before_message_id.to_string()),
+            ("limit", limit.to_string()),
+        ])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            tracing::debug!(
+                channel_id,
+                message_id = before_message_id,
+                status = %resp.status(),
+                "discord: failed to fetch recent context"
+            );
+            return String::new();
+        }
+        Err(error) => {
+            tracing::debug!(
+                channel_id,
+                message_id = before_message_id,
+                error = %error,
+                "discord: recent context fetch error"
+            );
+            return String::new();
+        }
+    };
+
+    let messages = match response.json::<Vec<serde_json::Value>>().await {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::debug!(
+                channel_id,
+                message_id = before_message_id,
+                error = %error,
+                "discord: recent context decode error"
+            );
+            return String::new();
+        }
+    };
+
+    let mut lines = Vec::new();
+    for message in messages.into_iter().rev() {
+        let author = message
+            .get("author")
+            .and_then(|a| a.get("username"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let attachment_summary = message
+            .get("attachments")
+            .and_then(|v| v.as_array())
+            .map(|atts| {
+                atts.iter()
+                    .filter_map(summarize_discord_attachment)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+
+        let line = match (content.is_empty(), attachment_summary.is_empty()) {
+            (false, false) => format!("- @{author}: {content} {attachment_summary}"),
+            (false, true) => format!("- @{author}: {content}"),
+            (true, false) => format!("- @{author}: {attachment_summary}"),
+            (true, true) => continue,
+        };
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("[Recent Discord context]\n{}\n", lines.join("\n"))
+    }
+}
+
+fn build_discord_wakeup_content(
+    clean_content: &str,
+    attachment_text: &str,
+    recent_context: &str,
+) -> String {
+    if !clean_content.is_empty() && attachment_text.is_empty() {
+        return clean_content.to_string();
+    }
+
+    if !clean_content.is_empty() {
+        return format!("{clean_content}\n\n[Attachments]\n{attachment_text}");
+    }
+
+    let mut parts = Vec::new();
+    if !recent_context.is_empty() {
+        parts.push(recent_context.trim().to_string());
+    }
+
+    if !attachment_text.is_empty() {
+        parts.push(format!(
+            "The user pinged you without text but included attachments.\n\n[Attachments]\n{attachment_text}"
+        ));
+    } else {
+        parts.push(
+            "The user pinged you without additional text. Use the recent Discord context above to infer what they want, and ask a brief clarifying question if needed."
+                .to_string(),
+        );
+    }
+
+    parts.join("\n\n")
 }
 
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
@@ -1079,24 +1232,37 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let atts = d
+                        .get("attachments")
+                        .and_then(|a| a.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // DMs carry no guild_id in the Discord gateway payload. They are
                     // inherently private and implicitly addressed to the bot, so bypass
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
                     let effective_mention_only = self.mention_only && !is_dm;
+                    let allow_empty_trigger =
+                        !atts.is_empty() || contains_bot_mention(content, &bot_user_id);
                     let Some(clean_content) =
-                        normalize_incoming_content(content, effective_mention_only, &bot_user_id)
+                        normalize_incoming_content(
+                            content,
+                            effective_mention_only,
+                            &bot_user_id,
+                            allow_empty_trigger,
+                        )
                     else {
                         continue;
                     };
 
+                    let client = self.http_client();
                     let attachment_text = {
-                        let atts = d
-                            .get("attachments")
-                            .and_then(|a| a.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        let client = self.http_client();
                         let mut text_parts = process_attachments(&atts, &client).await;
 
                         // Transcribe audio attachments when transcription is configured
@@ -1119,18 +1285,20 @@ impl Channel for DiscordChannel {
 
                         text_parts
                     };
-                    let final_content = if attachment_text.is_empty() {
-                        clean_content
+                    let recent_context = if clean_content.is_empty() && !channel_id.is_empty() {
+                        fetch_recent_discord_context(
+                            &client,
+                            &self.bot_token,
+                            &channel_id,
+                            message_id,
+                            5,
+                        )
+                        .await
                     } else {
-                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                        String::new()
                     };
-
-                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d
-                        .get("channel_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let final_content =
+                        build_discord_wakeup_content(&clean_content, &attachment_text, &recent_context);
 
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
@@ -1713,20 +1881,32 @@ mod tests {
 
     #[test]
     fn normalize_incoming_content_requires_mention_when_enabled() {
-        let cleaned = normalize_incoming_content("hello there", true, "12345");
+        let cleaned = normalize_incoming_content("hello there", true, "12345", false);
         assert!(cleaned.is_none());
     }
 
     #[test]
     fn normalize_incoming_content_strips_mentions_and_trims() {
-        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345");
+        let cleaned = normalize_incoming_content("  <@!12345> run status  ", true, "12345", false);
         assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
     #[test]
     fn normalize_incoming_content_rejects_empty_after_strip() {
-        let cleaned = normalize_incoming_content("<@12345>", true, "12345");
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345", false);
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn normalize_incoming_content_allows_empty_after_strip_when_requested() {
+        let cleaned = normalize_incoming_content("<@12345>", true, "12345", true);
+        assert_eq!(cleaned.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn normalize_incoming_content_allows_empty_raw_content_when_requested() {
+        let cleaned = normalize_incoming_content("", false, "12345", true);
+        assert_eq!(cleaned.as_deref(), Some(""));
     }
 
     // mention_only DM-bypass tests
@@ -1738,7 +1918,8 @@ mod tests {
         let mention_only = true;
         let is_dm = true;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned =
+            normalize_incoming_content("hello without mention", effective, "12345", false);
         assert_eq!(cleaned.as_deref(), Some("hello without mention"));
     }
 
@@ -1749,7 +1930,8 @@ mod tests {
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        let cleaned =
+            normalize_incoming_content("hello without mention", effective, "12345", false);
         assert!(cleaned.is_none());
     }
 
@@ -1760,8 +1942,28 @@ mod tests {
         let mention_only = true;
         let is_dm = false;
         let effective = mention_only && !is_dm;
-        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345");
+        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345", false);
         assert_eq!(cleaned.as_deref(), Some("run status"));
+    }
+
+    #[test]
+    fn build_discord_wakeup_content_uses_recent_context_for_bare_ping() {
+        let content = build_discord_wakeup_content(
+            "",
+            "",
+            "[Recent Discord context]\n- @alice: can you review this?\n",
+        );
+        assert!(content.contains("[Recent Discord context]"));
+        assert!(content.contains("The user pinged you without additional text."));
+    }
+
+    #[test]
+    fn build_discord_wakeup_content_keeps_attachment_only_prompts_actionable() {
+        let content =
+            build_discord_wakeup_content("", "[IMAGE:https://cdn.discordapp.com/foo.png]", "");
+        assert!(content.contains("included attachments"));
+        assert!(content.contains("[Attachments]"));
+        assert!(content.contains("[IMAGE:https://cdn.discordapp.com/foo.png]"));
     }
 
     // Message splitting tests
@@ -1802,11 +2004,9 @@ mod tests {
         let chunks = split_message_for_discord(&msg);
         // Should split into 5 chunks of <= 2000 chars
         assert_eq!(chunks.len(), 5);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
-        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
         // Verify total content is preserved
         let reconstructed = chunks.concat();
         assert_eq!(reconstructed, msg);
@@ -1901,11 +2101,9 @@ mod tests {
     fn split_chunks_always_within_discord_limit() {
         let msg = "x".repeat(12_345);
         let chunks = split_message_for_discord(&msg);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
-        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
     }
 
     #[test]

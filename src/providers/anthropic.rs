@@ -9,6 +9,7 @@ use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub struct AnthropicProvider {
     credential: Option<String>,
@@ -368,36 +369,46 @@ impl AnthropicProvider {
                 .all(|block| matches!(block, NativeContentOut::ToolResult { .. }))
     }
 
+    fn pending_tool_use_ids(native_messages: &[NativeMessage]) -> HashSet<String> {
+        let mut answered_ids = HashSet::new();
+
+        for message in native_messages.iter().rev() {
+            match message.role.as_str() {
+                "user" if Self::is_tool_result_only_message(message) => {
+                    answered_ids.extend(message.content.iter().filter_map(|block| match block {
+                        NativeContentOut::ToolResult { tool_use_id, .. } => {
+                            Some(tool_use_id.clone())
+                        }
+                        _ => None,
+                    }));
+                }
+                "assistant" => {
+                    return message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            NativeContentOut::ToolUse { id, .. } if !answered_ids.contains(id) => {
+                                Some(id.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                }
+                _ => return HashSet::new(),
+            }
+        }
+
+        HashSet::new()
+    }
+
     fn last_pending_tool_use_id(native_messages: &[NativeMessage]) -> Option<String> {
-        let last_assistant = native_messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "assistant")?;
-
-        let tool_use_ids: Vec<&str> = last_assistant
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                NativeContentOut::ToolUse { id, .. } => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        let answered_ids: Vec<&str> = native_messages
-            .iter()
-            .rev()
-            .take_while(|message| message.role == "user")
-            .flat_map(|message| message.content.iter())
-            .filter_map(|block| match block {
-                NativeContentOut::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        tool_use_ids
+        Self::pending_tool_use_ids(native_messages)
             .into_iter()
-            .find(|id| !answered_ids.contains(id))
-            .map(ToString::to_string)
+            .next()
+    }
+
+    fn tool_use_id_is_pending(native_messages: &[NativeMessage], tool_use_id: &str) -> bool {
+        Self::pending_tool_use_ids(native_messages).contains(tool_use_id)
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
@@ -429,6 +440,17 @@ impl AnthropicProvider {
                 }
                 "tool" => {
                     let tool_msg = if let Some(tr) = Self::parse_tool_result_message(&msg.content) {
+                        let tool_use_id = match tr.content.first() {
+                            Some(NativeContentOut::ToolResult { tool_use_id, .. }) => tool_use_id,
+                            _ => unreachable!("tool_result parser emitted non-tool_result block"),
+                        };
+                        if !Self::tool_use_id_is_pending(&native_messages, tool_use_id) {
+                            tracing::warn!(
+                                tool_use_id = %tool_use_id,
+                                "Dropping stale Anthropic tool result whose tool_use is no longer pending"
+                            );
+                            continue;
+                        }
                         tr
                     } else if let Some(tool_use_id) =
                         serde_json::from_str::<serde_json::Value>(&msg.content)
@@ -1144,7 +1166,7 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
+    use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
 
     #[test]
     fn creates_with_key() {
@@ -1794,7 +1816,7 @@ mod tests {
     /// ALL conversation turns and native tool definitions.
     #[tokio::test]
     async fn chat_with_tools_sends_full_history_and_native_tools() {
-        use axum::{Json, Router, routing::post};
+        use axum::{routing::post, Json, Router};
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
@@ -2205,6 +2227,58 @@ mod tests {
         assert!(
             matches!(&native_msgs[2].content[1], NativeContentOut::Text { .. }),
             "follow-up user text should remain in the same Anthropic user message"
+        );
+    }
+
+    #[test]
+    fn convert_messages_drops_orphan_tool_result_without_previous_tool_use() {
+        let messages = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("normal reply"),
+            ChatMessage::tool(r#"{"tool_call_id":"toolu_stale","content":"stale"}"#),
+            ChatMessage::user("next"),
+        ];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 3);
+        assert_eq!(native_msgs[0].role, "user");
+        assert_eq!(native_msgs[1].role, "assistant");
+        assert_eq!(native_msgs[2].role, "user");
+        assert!(
+            native_msgs[2]
+                .content
+                .iter()
+                .all(|block| matches!(block, NativeContentOut::Text { .. })),
+            "stale tool_result should be dropped instead of forwarded"
+        );
+    }
+
+    #[test]
+    fn convert_messages_drops_tool_result_after_followup_user_text() {
+        let messages = vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"toolu_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"toolu_1","content":"ok"}"#),
+            ChatMessage::user("thanks"),
+            ChatMessage::tool(r#"{"tool_call_id":"toolu_1","content":"stale retry"}"#),
+        ];
+
+        let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
+
+        assert_eq!(native_msgs.len(), 3);
+        assert_eq!(native_msgs[2].role, "user");
+        assert_eq!(native_msgs[2].content.len(), 2);
+        assert_eq!(
+            native_msgs[2]
+                .content
+                .iter()
+                .filter(|block| matches!(block, NativeContentOut::ToolResult { .. }))
+                .count(),
+            1,
+            "stale follow-up tool_result should be dropped"
         );
     }
 
