@@ -2514,6 +2514,7 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             None
         };
+        let requested_tool_count = request_tools.map_or(0, <[_]>::len);
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
@@ -2525,6 +2526,18 @@ pub(crate) async fn run_tool_call_loop(
             iteration + 1,
         );
         let mut streamed_live_deltas = false;
+        tracing::info!(
+            target: "critical_path.llm",
+            provider = active_provider_name,
+            model = active_model,
+            channel = channel_name,
+            turn_id = %turn_id,
+            iteration = iteration + 1,
+            message_count = prepared_messages.messages.len(),
+            tool_count = requested_tool_count,
+            streaming = should_consume_provider_stream,
+            "Starting LLM provider call"
+        );
 
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
@@ -2548,6 +2561,7 @@ pub(crate) async fn run_tool_call_loop(
                     })
                 }
                 Err(stream_err) => {
+                    let safe_stream_error = scrub_credentials(&stream_err.to_string());
                     tracing::warn!(
                         provider = active_provider_name,
                         model = active_model,
@@ -2564,8 +2578,19 @@ pub(crate) async fn run_tool_call_loop(
                         Some("provider stream failed; fallback to non-streaming chat"),
                         serde_json::json!({
                             "iteration": iteration + 1,
-                            "error": scrub_credentials(&stream_err.to_string()),
+                            "error": safe_stream_error,
                         }),
+                    );
+                    tracing::warn!(
+                        target: "critical_path.llm",
+                        provider = active_provider_name,
+                        model = active_model,
+                        channel = channel_name,
+                        turn_id = %turn_id,
+                        iteration = iteration + 1,
+                        elapsed_ms = llm_started_at.elapsed().as_millis(),
+                        error = %scrub_credentials(&stream_err.to_string()),
+                        "Streaming provider call failed; falling back to non-streaming chat"
                     );
                     if let Some(ref tx) = on_delta {
                         let _ = tx.send(DraftEvent::Clear).await;
@@ -2734,6 +2759,21 @@ pub(crate) async fn run_tool_call_loop(
                         "parsed_tool_calls": calls.len(),
                     }),
                 );
+                tracing::info!(
+                    target: "critical_path.llm",
+                    provider = active_provider_name,
+                    model = active_model,
+                    channel = channel_name,
+                    turn_id = %turn_id,
+                    iteration = iteration + 1,
+                    elapsed_ms = llm_started_at.elapsed().as_millis(),
+                    response_chars = response_text.len(),
+                    native_tool_calls = resp.tool_calls.len(),
+                    input_tokens = resp_input_tokens.unwrap_or_default(),
+                    output_tokens = resp_output_tokens.unwrap_or_default(),
+                    streamed_live = streamed_live_deltas,
+                    "LLM provider call completed"
+                );
 
                 // Preserve native tool call IDs in assistant history so role=tool
                 // follow-up messages can reference the exact call id.
@@ -2791,6 +2831,17 @@ pub(crate) async fn run_tool_call_loop(
                         "iteration": iteration + 1,
                         "duration_ms": llm_started_at.elapsed().as_millis(),
                     }),
+                );
+                tracing::error!(
+                    target: "critical_path.llm",
+                    provider = active_provider_name,
+                    model = active_model,
+                    channel = channel_name,
+                    turn_id = %turn_id,
+                    iteration = iteration + 1,
+                    elapsed_ms = llm_started_at.elapsed().as_millis(),
+                    error = %safe_error,
+                    "LLM provider call failed"
                 );
 
                 // Context overflow recovery: trim history and retry

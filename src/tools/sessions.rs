@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -168,9 +169,26 @@ impl Tool for SessionsHistoryTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |v| v as usize);
 
+        let started_at = Instant::now();
+        tracing::info!(
+            target: "critical_path.session",
+            operation = "sessions_history",
+            session_id = session_id,
+            limit,
+            "Session history retrieval requested"
+        );
         let messages = self.backend.load(session_id);
 
         if messages.is_empty() {
+            tracing::info!(
+                target: "critical_path.session",
+                operation = "sessions_history",
+                session_id = session_id,
+                total_messages = 0,
+                returned_messages = 0,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "Session history retrieval returned no messages"
+            );
             return Ok(ToolResult {
                 success: true,
                 output: format!("No messages found for session '{session_id}'."),
@@ -181,6 +199,15 @@ impl Tool for SessionsHistoryTool {
         // Take the last `limit` messages
         let start = messages.len().saturating_sub(limit);
         let tail = &messages[start..];
+        tracing::info!(
+            target: "critical_path.session",
+            operation = "sessions_history",
+            session_id = session_id,
+            total_messages = messages.len(),
+            returned_messages = tail.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "Session history retrieval completed"
+        );
 
         let mut output = format!(
             "Session '{}': showing {}/{} messages\n",

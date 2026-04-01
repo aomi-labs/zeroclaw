@@ -13,6 +13,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
@@ -166,12 +167,23 @@ impl SqliteSessionBackend {
 
 impl SessionBackend for SqliteSessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+        let started_at = Instant::now();
         let conn = self.conn.lock();
         let mut stmt = match conn
             .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
         {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(error) => {
+                tracing::error!(
+                    target: "critical_path.session",
+                    backend = "sqlite",
+                    session_id = session_key,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "Failed to prepare session history query"
+                );
+                return Vec::new();
+            }
         };
 
         let rows = match stmt.query_map(params![session_key], |row| {
@@ -181,10 +193,29 @@ impl SessionBackend for SqliteSessionBackend {
             })
         }) {
             Ok(r) => r,
-            Err(_) => return Vec::new(),
+            Err(error) => {
+                tracing::error!(
+                    target: "critical_path.session",
+                    backend = "sqlite",
+                    session_id = session_key,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "Failed to execute session history query"
+                );
+                return Vec::new();
+            }
         };
 
-        rows.filter_map(|r| r.ok()).collect()
+        let messages: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        tracing::info!(
+            target: "critical_path.session",
+            backend = "sqlite",
+            session_id = session_key,
+            message_count = messages.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "Loaded session history from SQLite"
+        );
+        messages
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {

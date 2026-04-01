@@ -753,11 +753,32 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    tracing::info!(
+                        target: "critical_path.llm_attempt",
+                        provider = provider_name,
+                        model = *current_model,
+                        original_model = model,
+                        attempt = attempt + 1,
+                        max_attempts = self.max_retries + 1,
+                        tool_count = tools.len(),
+                        message_count = effective_messages.len(),
+                        "Starting provider attempt with native tools"
+                    );
                     match provider
                         .chat_with_tools(&effective_messages, tools, current_model, temperature)
                         .await
                     {
                         Ok(resp) => {
+                            tracing::info!(
+                                target: "critical_path.llm_attempt",
+                                provider = provider_name,
+                                model = *current_model,
+                                original_model = model,
+                                attempt = attempt + 1,
+                                max_attempts = self.max_retries + 1,
+                                context_truncated,
+                                "Provider attempt with native tools succeeded"
+                            );
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
@@ -837,6 +858,18 @@ impl Provider for ReliableProvider {
                                 failure_reason,
                                 &error_detail,
                             );
+                            tracing::error!(
+                                target: "critical_path.llm_attempt",
+                                provider = provider_name,
+                                model = *current_model,
+                                original_model = model,
+                                attempt = attempt + 1,
+                                max_attempts = self.max_retries + 1,
+                                reason = failure_reason,
+                                error = %error_detail,
+                                context_truncated,
+                                "Provider attempt with native tools failed"
+                            );
 
                             if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
@@ -909,12 +942,33 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    tracing::info!(
+                        target: "critical_path.llm_attempt",
+                        provider = provider_name,
+                        model = *current_model,
+                        original_model = model,
+                        attempt = attempt + 1,
+                        max_attempts = self.max_retries + 1,
+                        tool_count = request.tools.map_or(0, <[_]>::len),
+                        message_count = effective_messages.len(),
+                        "Starting provider attempt"
+                    );
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
+                            tracing::info!(
+                                target: "critical_path.llm_attempt",
+                                provider = provider_name,
+                                model = *current_model,
+                                original_model = model,
+                                attempt = attempt + 1,
+                                max_attempts = self.max_retries + 1,
+                                context_truncated,
+                                "Provider attempt succeeded"
+                            );
                             if attempt > 0
                                 || *current_model != model
                                 || context_truncated
@@ -993,6 +1047,18 @@ impl Provider for ReliableProvider {
                                 self.max_retries + 1,
                                 failure_reason,
                                 &error_detail,
+                            );
+                            tracing::error!(
+                                target: "critical_path.llm_attempt",
+                                provider = provider_name,
+                                model = *current_model,
+                                original_model = model,
+                                attempt = attempt + 1,
+                                max_attempts = self.max_retries + 1,
+                                reason = failure_reason,
+                                error = %error_detail,
+                                context_truncated,
+                                "Provider attempt failed"
                             );
 
                             if rate_limited && !non_retryable_rate_limit {

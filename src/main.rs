@@ -40,11 +40,83 @@ use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tracing::{info, warn};
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     config::schema::validate_temperature(t)
+}
+
+fn sentry_dsn_from_env() -> Option<String> {
+    std::env::var("ZEROCLAW_SENTRY_DSN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            Some(
+                "https://10bc94f3a11d0ba2b42c9b5e8850df4e@o4511090928451584.ingest.us.sentry.io/4511141083873280"
+                    .to_string(),
+            )
+        })
+}
+
+fn init_sentry() -> Result<Option<sentry::ClientInitGuard>> {
+    let Some(raw_dsn) = sentry_dsn_from_env() else {
+        return Ok(None);
+    };
+
+    let parsed_dsn = raw_dsn
+        .parse::<sentry::types::Dsn>()
+        .context("Invalid Sentry DSN in ZEROCLAW_SENTRY_DSN")?;
+
+    let environment = std::env::var("ZEROCLAW_ENV")
+        .ok()
+        .or_else(|| std::env::var("RUST_ENV").ok())
+        .map(Into::into);
+
+    let guard = sentry::init(sentry::ClientOptions {
+        dsn: Some(parsed_dsn),
+        release: sentry::release_name!(),
+        environment,
+        enable_logs: true,
+        send_default_pii: false,
+        ..Default::default()
+    });
+
+    Ok(Some(guard))
+}
+
+fn init_tracing(sentry_enabled: bool) -> Result<()> {
+    use sentry::integrations::tracing::EventFilter;
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let sentry_layer = sentry_enabled.then(|| {
+        sentry::integrations::tracing::layer()
+            .event_filter(|metadata| {
+                let critical_path = metadata.target().starts_with("critical_path.");
+                match (*metadata.level(), critical_path) {
+                    (tracing::Level::ERROR, true) => EventFilter::Event | EventFilter::Log,
+                    (tracing::Level::WARN, true) => EventFilter::Event | EventFilter::Log,
+                    (tracing::Level::INFO, true) => EventFilter::Log,
+                    (tracing::Level::DEBUG, true) => EventFilter::Breadcrumb,
+                    (tracing::Level::TRACE, true) => EventFilter::Ignore,
+                    (tracing::Level::ERROR, false) => EventFilter::Event | EventFilter::Log,
+                    (tracing::Level::WARN, false) => EventFilter::Log,
+                    _ => EventFilter::Ignore,
+                }
+            })
+            .span_filter(|_| false)
+    });
+
+    let subscriber = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt::layer())
+        .with(sentry_layer);
+
+    tracing::subscriber::set_global_default(subscriber)
+        .context("setting default subscriber failed")?;
+    Ok(())
 }
 
 fn print_no_command_help() -> Result<()> {
@@ -816,9 +888,8 @@ enum MemoryCommands {
     },
 }
 
-#[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn async_main() -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -847,15 +918,6 @@ async fn main() -> Result<()> {
         write_shell_completion(*shell, &mut stdout)?;
         return Ok(());
     }
-
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // provider flags were given, it runs the full interactive wizard; otherwise
@@ -1658,6 +1720,20 @@ async fn main() -> Result<()> {
             }
         },
     }
+}
+
+#[tokio::main]
+async fn tokio_main() -> Result<()> {
+    async_main().await
+}
+
+fn main() -> Result<()> {
+    let sentry = init_sentry()?;
+    init_tracing(sentry.is_some())?;
+    if sentry.is_some() {
+        info!("Sentry logging enabled for critical path tracing");
+    }
+    tokio_main()
 }
 
 fn handle_estop_command(
