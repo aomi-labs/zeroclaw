@@ -880,22 +880,34 @@ async fn fetch_recent_discord_context(
     }
 }
 
+fn should_fetch_recent_context(
+    is_dm: bool,
+    is_direct_mention: bool,
+    channel_id: &str,
+    message_id: &str,
+) -> bool {
+    !is_dm && is_direct_mention && !channel_id.is_empty() && !message_id.is_empty()
+}
+
 fn build_discord_wakeup_content(
     clean_content: &str,
     attachment_text: &str,
     recent_context: &str,
 ) -> String {
-    if !clean_content.is_empty() && attachment_text.is_empty() {
-        return clean_content.to_string();
-    }
-
-    if !clean_content.is_empty() {
-        return format!("{clean_content}\n\n[Attachments]\n{attachment_text}");
-    }
-
     let mut parts = Vec::new();
     if !recent_context.is_empty() {
         parts.push(recent_context.trim().to_string());
+    }
+
+    if !clean_content.is_empty() {
+        if attachment_text.is_empty() {
+            parts.push(clean_content.to_string());
+        } else {
+            parts.push(format!(
+                "{clean_content}\n\n[Attachments]\n{attachment_text}"
+            ));
+        }
+        return parts.join("\n\n");
     }
 
     if !attachment_text.is_empty() {
@@ -1248,8 +1260,8 @@ impl Channel for DiscordChannel {
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
                     let effective_mention_only = self.mention_only && !is_dm;
-                    let allow_empty_trigger =
-                        !atts.is_empty() || contains_bot_mention(content, &bot_user_id);
+                    let is_direct_mention = contains_bot_mention(content, &bot_user_id);
+                    let allow_empty_trigger = !atts.is_empty() || is_direct_mention;
                     let Some(clean_content) =
                         normalize_incoming_content(
                             content,
@@ -1285,7 +1297,12 @@ impl Channel for DiscordChannel {
 
                         text_parts
                     };
-                    let recent_context = if clean_content.is_empty() && !channel_id.is_empty() {
+                    let recent_context = if should_fetch_recent_context(
+                        is_dm,
+                        is_direct_mention,
+                        &channel_id,
+                        message_id,
+                    ) {
                         fetch_recent_discord_context(
                             &client,
                             &self.bot_token,
@@ -1958,12 +1975,36 @@ mod tests {
     }
 
     #[test]
+    fn build_discord_wakeup_content_keeps_recent_context_for_text_mentions() {
+        let content = build_discord_wakeup_content(
+            "what did we decide?",
+            "",
+            "[Recent Discord context]\n- @alice: let's ship on friday\n",
+        );
+        assert!(content.contains("[Recent Discord context]"));
+        assert!(content.contains("what did we decide?"));
+    }
+
+    #[test]
     fn build_discord_wakeup_content_keeps_attachment_only_prompts_actionable() {
         let content =
             build_discord_wakeup_content("", "[IMAGE:https://cdn.discordapp.com/foo.png]", "");
         assert!(content.contains("included attachments"));
         assert!(content.contains("[Attachments]"));
         assert!(content.contains("[IMAGE:https://cdn.discordapp.com/foo.png]"));
+    }
+
+    #[test]
+    fn should_fetch_recent_context_for_guild_mentions_with_text() {
+        assert!(should_fetch_recent_context(false, true, "123456", "7890"));
+    }
+
+    #[test]
+    fn should_not_fetch_recent_context_for_dms_or_non_mentions() {
+        assert!(!should_fetch_recent_context(true, true, "123456", "7890"));
+        assert!(!should_fetch_recent_context(false, false, "123456", "7890"));
+        assert!(!should_fetch_recent_context(false, true, "", "7890"));
+        assert!(!should_fetch_recent_context(false, true, "123456", ""));
     }
 
     // Message splitting tests
@@ -2004,9 +2045,11 @@ mod tests {
         let chunks = split_message_for_discord(&msg);
         // Should split into 5 chunks of <= 2000 chars
         assert_eq!(chunks.len(), 5);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
+        );
         // Verify total content is preserved
         let reconstructed = chunks.concat();
         assert_eq!(reconstructed, msg);
@@ -2101,9 +2144,11 @@ mod tests {
     fn split_chunks_always_within_discord_limit() {
         let msg = "x".repeat(12_345);
         let chunks = split_message_for_discord(&msg);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
+        );
     }
 
     #[test]
