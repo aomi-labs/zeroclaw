@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 

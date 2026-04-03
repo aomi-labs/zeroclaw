@@ -466,6 +466,41 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
+fn resolve_runtime_channel(
+    ctx: &ChannelRuntimeContext,
+    channel_name: &str,
+) -> Option<Arc<dyn Channel>> {
+    ctx.channels_by_name
+        .get(channel_name)
+        .or_else(|| {
+            channel_name
+                .split_once(':')
+                .and_then(|(base, _)| ctx.channels_by_name.get(base))
+        })
+        .cloned()
+}
+
+async fn notify_sender_scope_busy(ctx: Arc<ChannelRuntimeContext>, msg: &traits::ChannelMessage) {
+    let Some(channel) = resolve_runtime_channel(ctx.as_ref(), &msg.channel) else {
+        tracing::warn!(
+            channel = %msg.channel,
+            "busy notification: no registered channel found for reply"
+        );
+        return;
+    };
+
+    if ctx.ack_reactions {
+        let _ = channel
+            .add_reaction(&msg.reply_target, &msg.id, "\u{23F3}")
+            .await;
+    }
+
+    let busy_text = "Still working on your previous request in this chat.";
+    let _ = channel
+        .send(&SendMessage::new(busy_text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await;
+}
+
 /// Returns `true` when `content` is a `/stop` command (with optional `@botname` suffix).
 /// Not gated on channel type — all non-CLI channels support `/stop`.
 fn is_stop_command(content: &str) -> bool {
@@ -3497,17 +3532,7 @@ async fn run_message_dispatch_loop(
             } else {
                 "No in-flight task for this sender scope.".to_string()
             };
-            let channel = ctx
-                .channels_by_name
-                .get(&msg.channel)
-                .or_else(|| {
-                    // Multi-room channels use "name:qualifier" format (e.g. "matrix:!roomId");
-                    // fall back to base channel name for routing.
-                    msg.channel
-                        .split_once(':')
-                        .and_then(|(base, _)| ctx.channels_by_name.get(base))
-                })
-                .cloned();
+            let channel = resolve_runtime_channel(ctx.as_ref(), &msg.channel);
             if let Some(channel) = channel {
                 let reply_target = msg.reply_target.clone();
                 let thread_ts = msg.thread_ts.clone();
@@ -3523,6 +3548,22 @@ async fn run_message_dispatch_loop(
                 );
             }
             continue;
+        }
+
+        if msg.channel == "discord"
+            && !ctx
+                .interrupt_on_new_message
+                .enabled_for_channel(msg.channel.as_str())
+        {
+            let scope_key = interruption_scope_key(&msg);
+            let already_processing = {
+                let active = in_flight_by_sender.lock().await;
+                active.contains_key(&scope_key)
+            };
+            if already_processing {
+                notify_sender_scope_busy(Arc::clone(&ctx), &msg).await;
+                continue;
+            }
         }
 
         // ── Debounce: accumulate rapid messages per sender ──────────
@@ -11323,6 +11364,126 @@ This is an example JSON object for profile settings."#;
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn discord_follow_up_while_busy_returns_busy_ack_without_cancelling() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("discord".to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(150),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
+        let send_task = tokio::spawn(async move {
+            tx.send(traits::ChannelMessage {
+                id: "discord_msg_1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "dm-1".to_string(),
+                content: "first request".to_string(),
+                channel: "discord".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(traits::ChannelMessage {
+                id: "discord_msg_2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "dm-1".to_string(),
+                content: "?".to_string(),
+                channel: "discord".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        send_task.await.unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            2,
+            "expected one busy ack and one final reply"
+        );
+        assert!(sent_messages
+            .iter()
+            .any(|msg| msg == "dm-1:Still working on your previous request in this chat."));
+        assert!(sent_messages
+            .iter()
+            .any(|msg| msg.contains("echo: first request")));
+        drop(sent_messages);
+
+        let reactions_added = channel_impl.reactions_added.lock().await;
+        assert!(reactions_added
+            .iter()
+            .any(|(channel_id, message_id, emoji)| channel_id == "dm-1"
+                && message_id == "discord_msg_2"
+                && emoji == "⏳"));
     }
 
     #[test]

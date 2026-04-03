@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 
 // Use tokio_rustls's re-export of rustls types
 use tokio_rustls::rustls;
@@ -104,7 +104,11 @@ impl IrcMessage {
         self.prefix.as_ref().and_then(|p| {
             let end = p.find('!').unwrap_or(p.len());
             let nick = &p[..end];
-            if nick.is_empty() { None } else { Some(nick) }
+            if nick.is_empty() {
+                None
+            } else {
+                Some(nick)
+            }
         })
     }
 }

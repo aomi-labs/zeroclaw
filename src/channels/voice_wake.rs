@@ -8,14 +8,14 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::channels::transcription::transcribe_audio;
-use crate::config::TranscriptionConfig;
 use crate::config::schema::VoiceWakeConfig;
+use crate::config::TranscriptionConfig;
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 

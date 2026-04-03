@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::traits::{Channel, ChannelMessage, SendMessage};

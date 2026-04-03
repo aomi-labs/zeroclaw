@@ -11,7 +11,7 @@ use crate::providers::traits::ChatMessage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

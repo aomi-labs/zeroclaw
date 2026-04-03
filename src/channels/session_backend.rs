@@ -6,7 +6,7 @@
 
 use super::session_sqlite::SqliteSessionBackend;
 use crate::providers::traits::ChatMessage;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::sync::Arc;
@@ -190,11 +190,10 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
         assert!(tmp.path().join("sessions/sessions.db").exists());
-        assert!(
-            !tmp.path()
-                .join("sessions/telegram_room_alice.jsonl")
-                .exists()
-        );
+        assert!(!tmp
+            .path()
+            .join("sessions/telegram_room_alice.jsonl")
+            .exists());
     }
 
     #[test]
@@ -211,11 +210,10 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
         assert!(tmp.path().join("sessions/sessions.db").exists());
-        assert!(
-            tmp.path()
-                .join("sessions/telegram_room_alice.jsonl.migrated")
-                .exists()
-        );
+        assert!(tmp
+            .path()
+            .join("sessions/telegram_room_alice.jsonl.migrated")
+            .exists());
     }
 
     #[test]
